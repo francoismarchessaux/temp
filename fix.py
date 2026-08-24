@@ -117,3 +117,32 @@ contrib = (resid_bp * vega).abs().mean().sort_values(ascending=False)
 print("\ntop 10 nodes by mean |unexplained PnL contribution|:")
 _c = contrib.head(10).copy(); _c.index = [f"{a}x{b}" for a, b in _c.index]
 print(_c.round(2).to_string())
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#2. THETA METHOD
+sub = raw_ch.loc[:, [c for c in raw_ch.columns if c[0] == "1M"]].mean(axis=1)
+d = pd.DataFrame({"chg": sub, "wd": sub.index.dayofweek,
+                  "dom": sub.index.day, "bdom": sub.groupby([sub.index.year, sub.index.month]).cumcount()})
+print("by weekday:      ", d.groupby("wd")["chg"].mean().round(3).to_dict())
+print("by business-day-of-month:")
+print(d.groupby("bdom")["chg"].mean().round(3).to_string())
+print(f"\nvariance of the weekday means : {d.groupby('wd')['chg'].mean().var():.4f}")
+print(f"variance of the b-day-of-month means: {d.groupby('bdom')['chg'].mean().var():.4f}")
