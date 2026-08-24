@@ -37,6 +37,15 @@ REDUCED_TENORS = ["1Y", "2Y", "3Y", "4Y", "5Y", "7Y", "10Y",
 
 CALENDAR_AFFECTED = ("2D", "1W", "2W", "1M", "3M")
 
+# IRG (cap/floor) lives on a DIFFERENT pair of axes from SWOPT:
+#   expiry = cap maturity;  tenor = the INDEX tenor of the underlying forward
+#            (1M/3M/6M/12M), NOT a swap tenor.
+# So REDUCED_TENORS (1Y..30Y swap tenors) has essentially no intersection with
+# the IRG tenor axis, and passing the SWOPT grid to an IRG panel returns an
+# EMPTY frame. Always pass tenors=IRG_TENORS for IRG.
+IRG_TENORS = ["1M", "3M", "6M", "12M"]
+IRG_EXPIRIES = REDUCED_EXPIRIES          # cap maturities; use describe_grid() to check
+
 
 @dataclass
 class PCAConfig:
@@ -167,6 +176,19 @@ def _project_2d(surf: pd.DataFrame, expiries, tenors) -> pd.Series:
     return out.stack()
 
 
+def describe_grid(surfaces, name: str = "") -> Dict:
+    """Print the axis labels actually present. Run this BEFORE prepare_grid on any
+    new feed — it is how you find out that IRG tenors are 1M/3M/6M/12M and not
+    swap tenors."""
+    panel = to_panel(surfaces)
+    exp = sorted(set(panel.columns.get_level_values("expiry")), key=maturity_to_days)
+    ten = sorted(set(panel.columns.get_level_values("tenor")), key=maturity_to_days)
+    print(f"[{name or 'grid'}] {panel.shape[0]} dates x {panel.shape[1]} columns")
+    print(f"[{name or 'grid'}] expiries ({len(exp)}): {exp}")
+    print(f"[{name or 'grid'}] tenors   ({len(ten)}): {ten}")
+    return {"expiries": exp, "tenors": ten, "shape": panel.shape}
+
+
 def prepare_grid(surfaces, expiries=None, tenors=None,
                  drop_expiries=("2D",), verbose=True) -> pd.DataFrame:
     """Restrict a vol panel to the modelling grid. Reports missing pillars."""
@@ -185,6 +207,15 @@ def prepare_grid(surfaces, expiries=None, tenors=None,
     expiries = [e for e in expiries if e in have_e]
     tenors = [t for t in tenors if t in have_t]
     keep = [c for c in panel.columns if c[0] in set(expiries) and c[1] in set(tenors)]
+    if not keep:
+        have_e = sorted(have_e, key=maturity_to_days)
+        have_t = sorted(have_t, key=maturity_to_days)
+        raise ValueError(
+            "prepare_grid produced an EMPTY grid — the requested axes do not exist "
+            f"on this feed.\n  requested expiries: {expiries}\n  available: {have_e}\n"
+            f"  requested tenors  : {tenors}\n  available: {have_t}\n"
+            "If this is an IRG/cap feed, pass tenors=IRG_TENORS (1M/3M/6M/12M): its "
+            "tenor axis is the INDEX tenor, not a swap tenor.")
     out = panel.loc[:, keep]
     out = out.loc[:, _sort_grid(out.columns)]
 
@@ -526,6 +557,9 @@ def neighbour_correlation(changes: pd.DataFrame, tenor: str, max_sep: int = 6) -
     the feed is cumulative and MUST be stripped to caplet vols first.
     """
     cols = [c for c in changes.columns if c[1] == tenor]
+    if len(cols) < 2:
+        avail = sorted(set(changes.columns.get_level_values("tenor")), key=maturity_to_days)
+        raise KeyError(f"tenor {tenor!r} has {len(cols)} columns here; available: {avail}")
     cols = sorted(cols, key=lambda c: maturity_to_days(c[0]))
     C = changes[cols].corr().values
     out = {}
@@ -555,6 +589,37 @@ def seam_test(changes_a: pd.DataFrame, changes_b: pd.DataFrame,
     if len(out):
         out["suspect_duplicate"] = (out["corr"] > 0.995) & (
             out["tracking_err"] < 0.05 * out[f"std_{label_a}"])
+    return out.round(4)
+
+
+def irg_tenor_collapse_check(irg_tenors: Sequence[str],
+                             target_tenors: Sequence[str] = None,
+                             verbose: bool = True) -> pd.DataFrame:
+    """What happens to IRG vega when it is rebucketed onto the SWOPT tenor axis.
+
+    `bucket_matrix` clamps any source tenor at or below the first target pillar
+    into that pillar. Since every IRG index tenor (1M..12M) is <= 1Y, ALL of it
+    lands in the 1Y swap-tenor column. DataManager.vega_to_x_format does exactly
+    this, so it is the desk's existing convention — but it means a 3M caplet's
+    vega is modelled as 1Yx-tenor swaption vega, and the cap/floor tenor axis is
+    destroyed. That is why IRG must be carried as its OWN block (two_stage_model)
+    rather than merged into the SWOPT grid.
+
+    NOTE this replaces the old `seam_test` premise for IRG. 12M and 1Y are not a
+    duplicated series — they are different objects (index tenor vs swap tenor),
+    so a shared-pillar test correctly returns nothing.
+    """
+    target_tenors = list(REDUCED_TENORS if target_tenors is None else target_tenors)
+    W = bucket_matrix(list(irg_tenors), target_tenors)
+    out = W.loc[:, (W.abs().sum(axis=0) > 1e-12)]
+    if verbose:
+        first = target_tenors[0]
+        share = float(W[first].mean())
+        print(f"[irg-collapse] {len(irg_tenors)} IRG tenors -> {out.shape[1]} of "
+              f"{len(target_tenors)} target columns; mean weight on {first} = {share:.3f}")
+        if share > 0.99:
+            print(f"[irg-collapse] WARNING all IRG vega collapses into the {first} "
+                  "column — the cap tenor axis is lost. Model IRG as a separate block.")
     return out.round(4)
 
 
@@ -600,7 +665,11 @@ def transform_comparison(levels: pd.DataFrame, config: PCAConfig) -> pd.DataFram
 def _chi2_qq_slope(x: pd.DataFrame, max_dim: int = 40) -> float:
     """Slope of squared Mahalanobis distance vs chi-2 quantiles. 1.0 = MV normal."""
     from scipy import stats
-    X = x.values
+    # Standardise BEFORE projecting. Mahalanobis distance is affine-invariant, so a
+    # constant per-node sigma cannot change the joint fit — only a TIME-VARYING
+    # scaling (ewma) can. Without this line the SVD truncation broke that
+    # invariance and made raw vs zscore look different when they are not.
+    X = ((x - x.mean()) / x.std(ddof=1)).values
     if X.shape[1] > max_dim:                       # project to keep S invertible
         Xc = X - X.mean(0)
         _, _, Vt = np.linalg.svd(Xc, full_matrices=False)
